@@ -157,6 +157,22 @@ this lands near ScanSmart parity with no visible loss and fixes the "2.6 MB /
 you're scanning photographs or maps where re-encode artifacts matter — that
 preserves the raw scanner JPEG byte-for-byte.
 
+**The re-encode applies to BOTH scanner output formats.** The `epson2paperless`
+daemon can deposit each page as a JPEG *or* as a single-page PDF (its default
+`SCAN_FORMAT` is `pdf`). JPEG pages are re-encoded with ImageMagick/`sips`; PDF
+pages are **rasterized at 300 DPI and re-encoded at `--quality`** with
+ImageMagick *before* assembly. Earlier builds only re-encoded JPEG pages and
+concatenated PDF pages losslessly, so a real PDF-format scan stayed at full
+quality (~1.4 MB/page, ~4.3 MB for 3 pages). That is now fixed: a default-quality
+3-page PDF-format scan lands at **~300 KB/page / ~0.9 MB total**. `--full-quality`
+still preserves PDF pages via lossless `qpdf` concatenation.
+
+> **Note:** PDF-page size reduction needs **ImageMagick** (`magick`) — `sips`
+> cannot rasterize a PDF. On a machine with only `sips` (or no re-encoder), PDF
+> pages fall back to lossless `qpdf` concatenation and the tool warns that
+> `brew install imagemagick` is required to shrink them. JPEG pages are
+> unaffected and still re-encode with `sips`.
+
 - `--quality 1-100` — lower = smaller. ~80–85 is the sweet spot for text docs.
 - `--grayscale` — drop color before assembly; helps on color scans of B/W docs.
 - `--optimize 0-3` — hands off to `ocrmypdf --optimize N`. `0` (default) leaves
@@ -170,12 +186,13 @@ preserves the raw scanner JPEG byte-for-byte.
   all when you don't need 300 DPI detail.
 
 **Measured sizes** (see *Verification* at the bottom) confirm the lever is
-monotonic — `--quality 80 < --quality 85 (default) < --full-quality` on the same
-pages — and that for a dense full-page text scan `--quality 80` is roughly 73% of
-the `--full-quality` size. Real documents (with whitespace) compress
-considerably more than the synthetic dense-text pages used in the harness, which
-is why ScanSmart's real-world ~290 KB/page is a realistic target at these
-settings.
+monotonic — `--quality 60 < --quality 85 (default) < --full-quality` on the same
+real-sized 300-DPI pages — and that `--optimize 3` shrinks the result further
+still. On a realistic full-page 300-DPI scan the default q85 re-encode produces
+~300 KB/page versus ~1.4 MB/page at full quality (a ~4.6× reduction). Real
+documents (with whitespace) compress even more, so ScanSmart's real-world
+~290 KB/page is a realistic target at these settings; lowering `--dpi` or using
+`--grayscale` on B/W documents reduces it further.
 
 ## How grouping and finish work
 
@@ -199,13 +216,18 @@ settings.
    page files into staging and calls the exact `finishBatch()` function the real
    run uses — not a parallel copy — then asserts page count, a real text layer,
    cleanup, interrupt preservation, PDF-input handling, and the size lever.
-2. **PDF-mode input is handled.** If pages arrive as single-page **PDFs** (the
-   panel's "Save as PDF" choice), they are concatenated cleanly with
-   `qpdf --empty --pages … --` and OCR'd with `--skip-text` (so a page that
-   already carries text doesn't abort the run). A mixed JPEG+PDF batch is
-   rejected with a clear "re-scan the whole batch in one format" message rather
-   than silently dropping pages. If `qpdf` can't handle an input you're told to
-   **scan as JPEG**.
+2. **PDF-mode input is handled — and size-reduced.** If pages arrive as
+   single-page **PDFs** (the daemon's default `SCAN_FORMAT=pdf`, or the panel's
+   "Save as PDF" choice), the default path now **rasterizes each page at 300 DPI
+   and re-encodes it at `--quality`** (ImageMagick) before a lossless `img2pdf`
+   assembly, then OCRs normally — so PDF-format scans shrink exactly like JPEG
+   ones (~300 KB/page at q85 instead of ~1.4 MB/page). With **`--full-quality`**
+   the pages are instead concatenated losslessly with `qpdf --empty --pages … --`
+   and OCR'd with `--skip-text` (so a page that already carries text doesn't abort
+   the run). Without ImageMagick, PDF pages fall back to the lossless `qpdf`
+   concat with a warning. A mixed JPEG+PDF batch is rejected with a clear
+   "re-scan the whole batch in one format" message rather than silently dropping
+   pages.
 3. **Ctrl-C preserves captured pages.** Interrupting mid-batch does **not** delete
    staging. The tool prints exactly where your captured pages are and the command
    to resume/assemble them:
@@ -256,6 +278,12 @@ settings.
 - **"Communication problem — ensure a computer is attached" on the printer.** The
   daemon isn't running/ready when you pressed Scan. Start `scan-batch` first and
   wait for the Ready prompt; on the panel use *Scan → Computer → Paperless*.
+- **Mac sleeps mid-batch.** If the display/system sleeps between pages, the
+  in-flight scan to the daemon can fail. `scan-batch` holds the Mac awake for the
+  duration of a batch with macOS `caffeinate -dimsu` (started at watch time,
+  stopped on cleanup); if `caffeinate` isn't available it warns and continues. In
+  practice a scan interrupted by sleep can be recovered by waking the Mac and
+  re-selecting *Paperless* on the panel to continue the batch.
 
 ## Verification (what was actually run)
 
@@ -268,30 +296,42 @@ All of the following were run on this machine — **no live scanner** was involv
 - **`node --check scan-batch`** → syntax OK.
 - **`eslint`** → **not installed** on this machine, so it was skipped. If you
   install it (`npm i -g eslint` or `brew install eslint`), run `eslint scan-batch`.
-- **`./scan-batch --self-test`** → exit `0`, all 11 assertions pass:
+- **`./scan-batch --self-test`** → exit `0`, all assertions pass. The self-test
+  now includes two **realistic-sized** PDF-input cases ([5/10] and [6/10]) that
+  drive the real `finishBatch()` on full-page 2477×3500 300-DPI q95 pages
+  (~1.4 MB each) — the input size needed to expose the re-encode bug — and assert
+  the embedded images via `pdfimages -list`:
 
 ```
 === scan-batch self-test ===
 Node: v24.19.0
 Assembler: img2pdf; re-encoder: magick; jbig2=true pngquant=true
-[1/8] Positive: 3 JPEGs -> OCR searchable PDF (real finishBatch)
+[1/10] Positive: 3 JPEGs -> OCR searchable PDF (real finishBatch)
   OK: page count == 3 (pdfinfo)
   OK: real text layer present (pdftotext)
-[2/8] Success cleanup removes staging, keeps finished PDF
+[2/10] Success cleanup removes staging, keeps finished PDF
   OK: staging cleaned (no scan_* / daemon.log)
   OK: finished PDF untouched by cleanup
-[3/8] Simulated interrupt preserves captured pages (fix #3)
+[3/10] Simulated interrupt preserves captured pages (fix #3)
   OK: raw page preserved under interrupted status
   OK: interrupt maps to preserve (exit-code intent 130)
-[4/8] PDF-mode input concatenated via qpdf (fix #2)
+[4/10] PDF-mode input -> 2-page searchable PDF (real finishBatch)
   OK: PDF-input batch -> 2-page searchable PDF
-[5/8] Size controls reduce size (q80 < full-quality)
+[5/10] REALISTIC PDF-input default q85 recompresses pages (<700 KB/page)
+  OK: each PDF page recompressed to <700 KB at q85 (input ~1409 KB/page; got 299K, 300K, 300K)
+  OK: realistic PDF-input -> 3-page PDF
+  OK: realistic PDF-input has a searchable text layer (OCR ran, no --skip-text)
+  MEASURED (PDF-input q85): input ~1409 KB/page -> 299K, 300K, 300K embedded, total 907.3 KB
+[6/10] REALISTIC PDF-input --full-quality preserves pages (>1000 KB/page)
+  OK: --full-quality preserves each PDF page near scanner size (>1000 KB; got 1408K, 1406K, 1407K)
+  MEASURED (PDF-input full-quality): 1408K, 1406K, 1407K embedded, total 4.13 MB
+[7/10] Size controls reduce size (q80 < full-quality)
   OK: q80 (37.1 KB) < full-quality (47.2 KB) and default q85 (40.9 KB) < full-quality
-[6/8] No daemon started in self-test (no orphan possible)
+[8/10] No daemon started in self-test (no orphan possible)
   OK: no daemon child spawned
-[7/8] Watcher detects + orders two injected files
+[9/10] Watcher detects + orders two injected files
   OK: watcher saw 2 ordered files: scan_2026-01-01_000001.jpg, scan_2026-01-01_000002.jpg
-[8/8] --help lists new size-control flags
+[10/10] --help lists new size-control flags
   OK: help text includes --quality/--full-quality/--optimize/--dpi/--grayscale
 === SELF-TEST PASS ===
 ```
@@ -300,26 +340,26 @@ Assembler: img2pdf; re-encoder: magick; jbig2=true pngquant=true
   staged page, then signalled it): **SIGINT → exit 130**, **SIGTERM → exit 143**,
   and in both cases the captured page was **preserved** in staging (fix #3/#4).
 
-- **Measured output sizes** for a representative multi-page text scan, generated
-  with ImageMagick (no scanner). Two scenarios were measured:
+- **Measured output sizes** on **realistic full-page scanner input** — three
+  2477×3500 (300-DPI) RGB JPEG pages re-encoded at q95 (~1.41 MB/page, mimicking
+  the daemon's near-max-quality output), each wrapped as a single-page PDF and
+  run through the real finish/assembly path (no scanner). Per-page figures are
+  the embedded-image sizes from `pdfimages -list`:
 
-  *Self-test synthetic pages (near-blank, 3 pages):*
+  *PDF-format input (the daemon's default `SCAN_FORMAT=pdf`), 3 pages:*
 
-  | Mode | Total | Per page |
-  |------|-------|----------|
-  | `--full-quality` | 47.2 KB | 15.7 KB |
-  | default (`--quality 85`) | 40.9 KB | 13.6 KB |
-  | `--quality 80` | 37.1 KB | 12.4 KB |
+  | Mode | Per page (embedded) | 3-page total (merged) |
+  |------|---------------------|-----------------------|
+  | input (scanner original) | ~1409 KB | ~4.33 MB |
+  | `--full-quality` (lossless `qpdf` concat) | ~1407 KB | ~4.13 MB |
+  | default (`--quality 85`) | ~303 KB | ~0.93 MB |
+  | `--quality 60` | ~83 KB | ~0.26 MB |
 
-  *Dense full-page text pages at 300 DPI (3 pages, worst case for text):*
-
-  | Mode | Per page |
-  |------|----------|
-  | `--full-quality` | ~796 KB |
-  | default (`--quality 85`) | ~661 KB |
-  | `--quality 80` | ~579 KB |
-
-  The quality lever is monotonic in both. Dense synthetic text pages are heavier
-  than real documents (which have whitespace), so the real-world target remains
-  ScanSmart's measured **~290 KB/page** at these settings; lowering `--dpi` or
+  The quality lever is monotonic: **`--quality 60` (83 KB/pg) < `--quality 85`
+  (303 KB/pg) < `--full-quality` (1407 KB/pg)** on the same pages. `--optimize`
+  shrinks the result further still — on the same q85 PDF, `ocrmypdf --optimize 3`
+  took the finished file from ~929 KB down to **~137 KB** (jbig2enc + pngquant
+  installed). Before this fix, a 3-page PDF-format scan stayed at ~4.3 MB because
+  the pages were concatenated losslessly and never recompressed; the default now
+  lands near ScanSmart's real-world **~290 KB/page** target. Lowering `--dpi` or
   using `--grayscale` on B/W documents reduces it further.

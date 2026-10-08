@@ -96,6 +96,7 @@ class ExitError extends Error {
 const state = {
   daemonChild: null, // ChildProcess of `npm run dev`
   daemonPgid: null, // process-group id (== child.pid when detached)
+  caffeinate: null, // ChildProcess of `caffeinate` holding the Mac awake
   runStatus: "aborted", // ok | failed | aborted | interrupted
   mergedTmp: "", // intermediate merged (pre-OCR) PDF path
   daemonLog: "", // <staging>/daemon.log
@@ -382,6 +383,28 @@ function processImage(src, destDir, index) {
   return dst;
 }
 
+// Rasterize ONE page of a PDF-format scan into a re-encoded JPEG in destDir,
+// returning the new path. This is the PDF-route analogue of processImage: it
+// applies cfg.quality (and cfg.grayscale) so PDF-format scanner pages are
+// genuinely recompressed before the lossless img2pdf embeds them — the fix for
+// the "q85 doesn't shrink real PDFs" bug. Requires ImageMagick (sips cannot
+// rasterize a PDF); callers gate on state.reencoder === "magick".
+//
+// Density handling matters: `-density 300` BEFORE the input reproduces the
+// page's pixel grid at 300 DPI (not a downsampled 96-DPI raster); the trailing
+// `-units PixelsPerInch -density 300` re-tags the output JPEG at 300 PPI so the
+// embedded image reports the correct resolution (without it magick writes a
+// 96-PPI tag and the page mis-scales).
+function processPdfPage(src, destDir, index) {
+  const dst = path.join(destDir, `page_${String(index).padStart(4, "0")}.jpg`);
+  const a = ["-density", "300", `${src}[0]`];
+  if (cfg.grayscale) a.push("-colorspace", "Gray");
+  a.push("-units", "PixelsPerInch", "-density", "300", "-quality", String(cfg.quality), dst);
+  const r = run("magick", a);
+  if (r.status !== 0) throw new ExitError(4, `magick PDF rasterize failed: ${(r.stderr || "").trim()}`);
+  return dst;
+}
+
 function assembleImages(images, outPdf) {
   if (state.assembler === "img2pdf") {
     const r = run("img2pdf", ["--output", outPdf, ...images]);
@@ -425,7 +448,32 @@ function buildMergedPdf(pages, workDir) {
   const merged = path.join(workDir, `merged_${process.pid}.pdf`);
 
   if (allPdf) {
-    // Fix #2: PDF-mode input — concatenate single-page PDFs cleanly via qpdf.
+    // PDF-format input (the daemon's default SCAN_FORMAT=pdf deposits scan_*.pdf).
+    if (cfg.fullQuality) {
+      // Passthrough: concatenate single-page PDFs losslessly via qpdf, keeping
+      // the scanner's original full-quality JPEG untouched. OCR runs with
+      // --skip-text (fromPdf:true) so a page that already carries text can't
+      // abort the run.
+      concatPdfs(pages, merged);
+      return { mergedPdf: merged, pageCount: pages.length, fromPdf: true };
+    }
+    if (state.reencoder === "magick") {
+      // Size fix: rasterize each PDF page at cfg.quality so the page is genuinely
+      // recompressed BEFORE the lossless img2pdf embeds it, then assemble as
+      // images. The merged PDF now carries no pre-existing text layer, so the
+      // downstream OCR runs normally (fromPdf:false, no --skip-text).
+      const processed = [];
+      pages.forEach((src, idx) => {
+        processed.push(processPdfPage(src, workDir, idx + 1));
+      });
+      assembleImages(processed, merged);
+      return { mergedPdf: merged, pageCount: pages.length, fromPdf: false };
+    }
+    // No ImageMagick (sips can't rasterize a PDF, or no re-encoder at all):
+    // fall back to lossless qpdf concat so the batch still succeeds, and warn
+    // that PDF-page size reduction needs ImageMagick.
+    warn("PDF-format scans can only be size-reduced with ImageMagick " +
+      "(brew install imagemagick); preserving pages at full quality via qpdf concat.");
     concatPdfs(pages, merged);
     return { mergedPdf: merged, pageCount: pages.length, fromPdf: true };
   }
@@ -503,6 +551,34 @@ async function finishBatch(pages, { interactive = true, presetName = null } = {}
 }
 
 // ---------------------------------------------------------------------------
+// Keep the Mac awake during a batch (the user hit a mid-batch failure when the
+// display slept between pages). `caffeinate -dimsu` prevents display/idle/disk/
+// system sleep for the lifetime of the spawned child; it is killed in finalize.
+// No-op (with a warning) if caffeinate is absent (non-macOS / locked down) and
+// never started in --self-test.
+// ---------------------------------------------------------------------------
+function startCaffeinate() {
+  if (state.caffeinate) return;
+  if (!have("caffeinate")) {
+    warn("caffeinate not found; the Mac may sleep mid-batch. If a scan is lost " +
+      "to sleep, wake the Mac and re-select Paperless to continue.");
+    return;
+  }
+  try {
+    const child = spawn("caffeinate", ["-dimsu"], { stdio: "ignore", detached: false });
+    child.on("error", () => { state.caffeinate = null; });
+    state.caffeinate = child;
+    log("Holding the Mac awake for the batch (caffeinate).");
+  } catch { /* best-effort: never block a scan on this */ }
+}
+
+function stopCaffeinate() {
+  if (!state.caffeinate) return;
+  try { state.caffeinate.kill("SIGTERM"); } catch { /* already gone */ }
+  state.caffeinate = null;
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup + exit-code semantics (fixes #3 and #4)
 // ---------------------------------------------------------------------------
 function killDaemon() {
@@ -544,6 +620,7 @@ function cleanStaging() {
 function finalize(rc) {
   closeRl();
   killDaemon();
+  stopCaffeinate();
 
   if (state.runStatus === "failed") {
     if (cfg.staging && fs.existsSync(cfg.staging)) {
@@ -810,6 +887,45 @@ function makeTestJpeg(dst, label) {
   return false;
 }
 
+// Generate a REALISTIC scanner page: 2477x3500 (300-DPI A4-ish) RGB JPEG at
+// near-max quality (~1.4 MB), mimicking what the daemon embeds. Dense content
+// (plasma blended over white) is used deliberately: near-blank text pages
+// compress so well that a missing re-encode is invisible — which is exactly how
+// the size bug slipped past the old synthetic self-test. Returns true on success.
+function makeRealPageJpeg(dst, seed) {
+  if (!have("magick")) return false;
+  const r = run("magick", [
+    "-size", "2477x3500", "xc:white",
+    "(", "-size", "2477x3500", "-seed", String(seed), "plasma:fractal", ")",
+    "-compose", "blend", "-define", "compose:args=22", "-composite",
+    "-density", "300", "-units", "PixelsPerInch", "-quality", "95", dst,
+  ]);
+  return r.status === 0 && fs.existsSync(dst);
+}
+
+// Parse the per-image size column (KB) from `pdfimages -list`. The size column
+// is reported like "1409K"; strip the trailing K and return the numbers in KB.
+function pdfImageSizesKB(pdf) {
+  const r = run("pdfimages", ["-list", pdf]);
+  const lines = (r.stdout || "").split(/\r?\n/);
+  const sizes = [];
+  for (const line of lines) {
+    const cols = line.trim().split(/\s+/);
+    // Data rows begin with a numeric page number; the size column is the
+    // second-to-last field (…  x-ppi y-ppi SIZE RATIO).
+    if (cols.length < 4 || !/^\d+$/.test(cols[0])) continue;
+    const sizeCol = cols[cols.length - 2];
+    const m = sizeCol.match(/^([\d.]+)([KMG]?)$/);
+    if (!m) continue;
+    let kb = parseFloat(m[1]);
+    if (m[2] === "M") kb *= 1024;
+    else if (m[2] === "G") kb *= 1024 * 1024;
+    else if (m[2] === "") kb /= 1024; // bytes
+    sizes.push(kb);
+  }
+  return sizes;
+}
+
 function pdfPageCount(pdf) {
   const r = run("pdfinfo", [pdf]);
   const m = (r.stdout || "").match(/^Pages:\s+(\d+)/m);
@@ -839,9 +955,9 @@ async function selfTest() {
   log(`Assembler: ${state.assembler}; re-encoder: ${state.reencoder || "none"}; ` +
     `jbig2=${state.hasJbig2} pngquant=${state.hasPngquant}`);
 
-  // --- [1/8] Positive: 3 text JPEGs -> searchable 3-page PDF via REAL finishBatch
+  // --- [1/10] Positive: 3 text JPEGs -> searchable 3-page PDF via REAL finishBatch
   log("");
-  log("[1/8] Positive: 3 JPEGs -> OCR searchable PDF (real finishBatch)");
+  log("[1/10] Positive: 3 JPEGs -> OCR searchable PDF (real finishBatch)");
   const p1 = path.join(cfg.staging, "scan_2026-01-01_000001.jpg");
   const p2 = path.join(cfg.staging, "scan_2026-01-01_000002.jpg");
   const p3 = path.join(cfg.staging, "scan_2026-01-01_000003.jpg");
@@ -864,9 +980,9 @@ async function selfTest() {
     assert(false, "output PDF created");
   }
 
-  // --- [2/8] Success cleanup removes staged pages + daemon.log, keeps finished PDF
+  // --- [2/10] Success cleanup removes staged pages + daemon.log, keeps finished PDF
   log("");
-  log("[2/8] Success cleanup removes staging, keeps finished PDF");
+  log("[2/10] Success cleanup removes staging, keeps finished PDF");
   // Re-stage dummy artifacts, then invoke the real cleanStaging().
   fs.writeFileSync(path.join(cfg.staging, "scan_2026-01-01_000009.jpg"), "x");
   fs.writeFileSync(path.join(cfg.staging, "daemon.log"), "x");
@@ -877,9 +993,9 @@ async function selfTest() {
   assert(stagingGone, "staging cleaned (no scan_* / daemon.log)");
   assert(posOut ? fs.existsSync(posOut) : false, "finished PDF untouched by cleanup");
 
-  // --- [3/8] Simulated interrupt PRESERVES captured pages (fix #3, exit 130)
+  // --- [3/10] Simulated interrupt PRESERVES captured pages (fix #3, exit 130)
   log("");
-  log("[3/8] Simulated interrupt preserves captured pages (fix #3)");
+  log("[3/10] Simulated interrupt preserves captured pages (fix #3)");
   fs.mkdirSync(cfg.staging, { recursive: true });
   const ip = path.join(cfg.staging, "scan_2026-02-02_000001.jpg");
   fs.writeFileSync(ip, "captured");
@@ -896,9 +1012,9 @@ async function selfTest() {
   state.runStatus = "aborted";
   state.finished = false;
 
-  // --- [4/8] PDF-input handling: concatenate single-page PDFs (fix #2)
+  // --- [4/10] PDF-input handling: 2-page searchable PDF via REAL finishBatch
   log("");
-  log("[4/8] PDF-mode input concatenated via qpdf (fix #2)");
+  log("[4/10] PDF-mode input -> 2-page searchable PDF (real finishBatch)");
   if (have("qpdf") && posOut) {
     // Build two single-page PDFs by splitting the positive output.
     const pdfA = path.join(cfg.staging, "scan_2026-03-03_000001.pdf");
@@ -918,9 +1034,119 @@ async function selfTest() {
     assert(false, "qpdf available for PDF-input test");
   }
 
-  // --- [5/8] Size controls: q80 materially smaller than full-quality
+  // --- [5/10] REALISTIC PDF-input size fix: default q85 genuinely recompresses
+  // each PDF-format page BEFORE assembly. This is the regression guard for the
+  // "q85 doesn't shrink real PDFs" bug. Uses full-sized 2477x3500 300-DPI q95
+  // pages (~1.4 MB each) — the only input large enough to expose the bug — and
+  // asserts, via pdfimages -list, that each embedded page is MATERIALLY smaller
+  // than the ~1400 KB full-quality input (threshold 700 KB; a correct q85 lands
+  // ~300 KB). Also asserts a searchable text layer is present.
   log("");
-  log("[5/8] Size controls reduce size (q80 < full-quality)");
+  log("[5/10] REALISTIC PDF-input default q85 recompresses pages (<700 KB/page)");
+  const canRealPdf = have("magick") && have("img2pdf") && have("qpdf");
+  if (canRealPdf) {
+    fs.mkdirSync(cfg.staging, { recursive: true });
+    const rp = [
+      path.join(cfg.staging, "scan_2026-04-04_000001.pdf"),
+      path.join(cfg.staging, "scan_2026-04-04_000002.pdf"),
+      path.join(cfg.staging, "scan_2026-04-04_000003.pdf"),
+    ];
+    let inputKB = -1;
+    let built = true;
+    rp.forEach((pdf, i) => {
+      const jpg = path.join(cfg.staging, `real_src_${i + 1}.jpg`);
+      if (!makeRealPageJpeg(jpg, i + 1)) { built = false; return; }
+      if (i === 0) inputKB = Math.round(fs.statSync(jpg).size / 1024);
+      const r = run("img2pdf", ["--output", pdf, jpg]);
+      if (r.status !== 0 || !fs.existsSync(pdf)) built = false;
+      try { fs.rmSync(jpg, { force: true }); } catch { /* ignore */ }
+    });
+    if (!built) {
+      assert(false, "generate realistic PDF-format pages (magick/img2pdf)");
+    } else {
+      const savedQ = cfg.quality, savedFull = cfg.fullQuality;
+      cfg.quality = 85; cfg.fullQuality = false;
+      state.stagedPages = rp.slice();
+      let q85Out = null, q85Sizes = [];
+      try {
+        const res = await finishBatch(rp, { interactive: false, presetName: "pdfin-q85" });
+        q85Out = res.outPath;
+        if (q85Out) q85Sizes = pdfImageSizesKB(q85Out);
+      } catch (e) { assert(false, `realistic PDF q85 finishBatch threw: ${e.message}`); }
+      cfg.quality = savedQ; cfg.fullQuality = savedFull;
+
+      if (q85Out && q85Sizes.length === 3) {
+        const maxKB = Math.max(...q85Sizes);
+        assert(maxKB < 700,
+          `each PDF page recompressed to <700 KB at q85 ` +
+          `(input ~${inputKB} KB/page; got ${q85Sizes.map((k) => Math.round(k) + "K").join(", ")})`);
+        assert(pdfPageCount(q85Out) === 3, "realistic PDF-input -> 3-page PDF");
+        assert(run("pdftotext", [q85Out, "-"]).status === 0,
+          "realistic PDF-input has a searchable text layer (OCR ran, no --skip-text)");
+        log(`  MEASURED (PDF-input q85): input ~${inputKB} KB/page -> ` +
+          `${q85Sizes.map((k) => Math.round(k) + "K").join(", ")} embedded, ` +
+          `total ${fmtBytes(fs.statSync(q85Out).size)}`);
+      } else {
+        assert(false, "realistic PDF-input q85 produced a 3-image PDF");
+      }
+    }
+  } else {
+    assert(true, "SKIP realistic PDF-input q85 (needs magick+img2pdf+qpdf)");
+  }
+
+  // --- [6/10] REALISTIC PDF-input --full-quality PRESERVES pages (passthrough).
+  // Locks in the contract that --full-quality does NOT recompress PDF pages:
+  // each embedded image stays near the ~1400 KB scanner original (>1000 KB).
+  log("");
+  log("[6/10] REALISTIC PDF-input --full-quality preserves pages (>1000 KB/page)");
+  if (canRealPdf) {
+    fs.mkdirSync(cfg.staging, { recursive: true });
+    const fp = [
+      path.join(cfg.staging, "scan_2026-05-05_000001.pdf"),
+      path.join(cfg.staging, "scan_2026-05-05_000002.pdf"),
+      path.join(cfg.staging, "scan_2026-05-05_000003.pdf"),
+    ];
+    let built = true;
+    fp.forEach((pdf, i) => {
+      const jpg = path.join(cfg.staging, `fq_src_${i + 1}.jpg`);
+      if (!makeRealPageJpeg(jpg, i + 10)) { built = false; return; }
+      const r = run("img2pdf", ["--output", pdf, jpg]);
+      if (r.status !== 0 || !fs.existsSync(pdf)) built = false;
+      try { fs.rmSync(jpg, { force: true }); } catch { /* ignore */ }
+    });
+    if (!built) {
+      assert(false, "generate realistic PDF-format pages for full-quality test");
+    } else {
+      const savedQ = cfg.quality, savedFull = cfg.fullQuality;
+      cfg.fullQuality = true;
+      state.stagedPages = fp.slice();
+      let fqOut = null, fqSizes = [];
+      try {
+        const res = await finishBatch(fp, { interactive: false, presetName: "pdfin-full" });
+        fqOut = res.outPath;
+        if (fqOut) fqSizes = pdfImageSizesKB(fqOut);
+      } catch (e) { assert(false, `realistic PDF full-quality finishBatch threw: ${e.message}`); }
+      cfg.quality = savedQ; cfg.fullQuality = savedFull;
+
+      if (fqOut && fqSizes.length === 3) {
+        const minKB = Math.min(...fqSizes);
+        assert(minKB > 1000,
+          `--full-quality preserves each PDF page near scanner size (>1000 KB; ` +
+          `got ${fqSizes.map((k) => Math.round(k) + "K").join(", ")})`);
+        log(`  MEASURED (PDF-input full-quality): ` +
+          `${fqSizes.map((k) => Math.round(k) + "K").join(", ")} embedded, ` +
+          `total ${fmtBytes(fs.statSync(fqOut).size)}`);
+      } else {
+        assert(false, "realistic PDF-input full-quality produced a 3-image PDF");
+      }
+    }
+  } else {
+    assert(true, "SKIP realistic PDF-input full-quality (needs magick+img2pdf+qpdf)");
+  }
+
+  // --- [7/10] Size controls: q80 materially smaller than full-quality
+  log("");
+  log("[7/10] Size controls reduce size (q80 < full-quality)");
   let sizeFull = -1, sizeQ80 = -1, sizeDefault = -1;
   if (madeImgs) {
     const pages = [p1, p2, p3];
@@ -969,14 +1195,18 @@ async function selfTest() {
     assert(false, "size-control test skipped (no test images)");
   }
 
-  // --- [6/8] No daemon orphan possible in this mode
+  // --- [8/10] No daemon orphan possible in this mode; caffeinate not spawned
   log("");
-  log("[6/8] No daemon started in self-test (no orphan possible)");
+  log("[8/10] No daemon started in self-test (no orphan possible)");
   assert(state.daemonChild === null && state.daemonPgid === null, "no daemon child spawned");
+  // Anti-sleep hardening: caffeinate is detected via have() but must NOT be
+  // spawned in --self-test (startCaffeinate is only called on the real path).
+  assert(state.caffeinate === null,
+    `no caffeinate process spawned in self-test (detected on PATH: ${have("caffeinate")})`);
 
-  // --- [7/8] Watcher detects + orders two injected files
+  // --- [9/10] Watcher detects + orders two injected files
   log("");
-  log("[7/8] Watcher detects + orders two injected files");
+  log("[9/10] Watcher detects + orders two injected files");
   const watchDir = path.join(td, "watch");
   fs.mkdirSync(watchDir, { recursive: true });
   const detected = await watcherProbe(watchDir);
@@ -984,9 +1214,9 @@ async function selfTest() {
     path.basename(detected[0]) < path.basename(detected[1]),
     `watcher saw 2 ordered files: ${detected.map((d) => path.basename(d)).join(", ")}`);
 
-  // --- [8/8] node --check self (syntax) is run externally; assert help/flags here
+  // --- [10/10] node --check self (syntax) is run externally; assert help/flags here
   log("");
-  log("[8/8] --help lists new size-control flags");
+  log("[10/10] --help lists new size-control flags");
   assert(true, "help text includes --quality/--full-quality/--optimize/--dpi/--grayscale (see --help)");
 
   // Clean up temp root entirely.
@@ -1072,6 +1302,9 @@ async function main() {
   } else {
     log(`(--no-daemon) Skipping helper-app quit and daemon startup; watching ${cfg.staging}.`);
   }
+
+  // Keep the Mac awake while the user scans the batch (see startCaffeinate).
+  startCaffeinate();
 
   const pages = await watchAndWait();
   await finishBatch(pages, { interactive: true });
