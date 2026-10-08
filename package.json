@@ -1,0 +1,11 @@
+{
+  "name": "scan-batch",
+  "version": "2.0.0",
+  "description": "Node host-side wrapper that groups Epson ET-3700 flatbed scans into one OCR'd, searchable PDF via the epson2paperless daemon.",
+  "bin": {
+    "scan-batch": "./scan-batch"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
