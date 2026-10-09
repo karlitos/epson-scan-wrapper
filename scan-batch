@@ -65,6 +65,7 @@ const cfg = {
   optimize: 0, // ocrmypdf --optimize N (0-3)
   dpi: null, // SCAN_RESOLUTION for the daemon; null = scanner default
   grayscale: false,
+  keepStaging: false, // --keep-staging: on a SUCCESSFUL finish, keep raw scan_* pages
 };
 
 // ET-3700 advertises these DPI values; others pass through with a warning.
@@ -127,6 +128,9 @@ OUTPUT / PATHS
                         (a positional first argument is also accepted as OUTPUT_DIR)
   --staging <dir>       Hidden work folder for raw per-page scans.
                         Default: <OUTPUT_DIR>/.work
+  --keep-staging        On a successful finish, keep the raw scan_* pages in
+                        the staging folder instead of deleting them (for
+                        inspection / reuse).
   --printer-ip <ip>     Printer IP for the daemon. Default: 192.168.178.3
   --e2p <path>          Path to the epson2paperless checkout.
                         Default: ~/Dev/epson2paperless
@@ -150,6 +154,7 @@ PDF SIZE CONTROLS
 MODES
   --self-test           Run the offline self-test (no daemon, no scanner) and exit.
   --no-daemon           Skip helper-app quit + daemon startup (file-based mode).
+  --version             Print tool name, version, git commit, Node version; exit.
   -h, --help            Show this help and exit.
 
 FLOW
@@ -161,6 +166,31 @@ EXIT CODES
   0 success · 2 port busy · 3 daemon not ready · 4 assemble failed ·
   5 ocr failed · 130 interrupted (SIGINT) · 143 terminated (SIGTERM).
   On interrupt the captured raw pages are PRESERVED (not deleted).`);
+}
+
+// ---------------------------------------------------------------------------
+// Version string: tool name + version (package.json next to the script, else
+// the literal "2.1") + git short commit (resolved in the script's own dir, or
+// "unknown" if git is absent / not a repo) + the Node version. Needs no
+// external scanner/ocr tools so --version works on a bare machine.
+// ---------------------------------------------------------------------------
+function versionString() {
+  const scriptDir = path.dirname(fs.realpathSync(__filename));
+  let version = "2.1";
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(scriptDir, "package.json"), "utf8"));
+    if (pkg && pkg.version) version = String(pkg.version);
+  } catch { /* no package.json / unreadable — keep the fallback */ }
+
+  let commit = "unknown";
+  if (have("git")) {
+    const r = run("git", ["rev-parse", "--short", "HEAD"], { cwd: scriptDir });
+    if (r.status === 0 && r.stdout) {
+      const s = r.stdout.trim();
+      if (s) commit = s;
+    }
+  }
+  return `scan-batch ${version} (${commit}) node ${process.version}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +254,10 @@ function parseArgs(argv) {
         else throw new ExitError(1, `--color-mode must be gray|color, got '${m}'`);
         break;
       }
+      case "--keep-staging":
+        cfg.keepStaging = true; break;
+      case "--version":
+        log(versionString()); throw new ExitError(0);
       case "--self-test":
         cfg.selfTest = true; cfg.noDaemon = true; break;
       case "--no-daemon":
@@ -605,6 +639,10 @@ function killDaemon() {
 // Remove this batch's temp files + staged raw pages (success/abort only).
 function cleanStaging() {
   if (!state.stagingReady || !cfg.staging) return;
+  if (cfg.keepStaging) {
+    log(`--keep-staging: raw pages kept in ${cfg.staging}`);
+    return;
+  }
   let entries = [];
   try { entries = fs.readdirSync(cfg.staging); } catch { return; }
   for (const e of entries) {
@@ -994,6 +1032,19 @@ async function selfTest() {
     fs.readdirSync(cfg.staging).filter((e) => isPageFile(e) || e === "daemon.log").length === 0;
   assert(stagingGone, "staging cleaned (no scan_* / daemon.log)");
   assert(posOut ? fs.existsSync(posOut) : false, "finished PDF untouched by cleanup");
+
+  // --keep-staging sub-assertion: a successful-run cleanup with cfg.keepStaging
+  // leaves the raw scan_* page in place. Reset the flag afterwards so later
+  // phases (which expect normal cleanup) are unaffected.
+  fs.mkdirSync(cfg.staging, { recursive: true });
+  const keepPage = path.join(cfg.staging, "scan_2026-01-01_000010.jpg");
+  fs.writeFileSync(keepPage, "x");
+  cfg.keepStaging = true;
+  cleanStaging();
+  assert(fs.existsSync(keepPage), "--keep-staging preserves staged scan_* page");
+  cfg.keepStaging = false;
+  // Normal cleanup now removes the page we just kept, restoring the clean state.
+  cleanStaging();
 
   // --- [3/10] Simulated interrupt PRESERVES captured pages (fix #3, exit 130)
   log("");
