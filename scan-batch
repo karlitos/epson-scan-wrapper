@@ -58,7 +58,9 @@ const cfg = {
   selfTest: false,
   noDaemon: false,
   // Size controls
-  quality: 85, // default re-encode JPEG quality (see README justification)
+  quality: 70, // default re-encode JPEG quality — q70 color is visually clean on
+  // document scans and ~halves file size vs the scanner's native q90 JPEG, keeping
+  // multipage PDFs under typical email attachment limits (see README justification).
   fullQuality: false, // --full-quality: skip re-encode, preserve raw JPEG
   optimize: 0, // ocrmypdf --optimize N (0-3)
   dpi: null, // SCAN_RESOLUTION for the daemon; null = scanner default
@@ -132,8 +134,8 @@ OUTPUT / PATHS
 
 PDF SIZE CONTROLS
   --quality <1-100>     Re-encode each page JPEG at this quality during assembly.
-                        Default: 85. ~80-85 lands near ~290 KB/page on text docs
-                        (roughly ScanSmart parity, ~6x smaller than passthrough).
+                        Default: 70. q70 color is visually clean on document
+                        scans and ~halves size vs the scanner's native q90 JPEG.
   --full-quality        Skip re-encode; preserve the raw scanner JPEG. Use for
                         photos/maps where re-encode artifacts matter.
   --optimize <0-3>      Pass to ocrmypdf --optimize N. 0 = off (default).
