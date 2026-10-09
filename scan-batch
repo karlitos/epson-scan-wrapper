@@ -66,6 +66,11 @@ const cfg = {
   dpi: null, // SCAN_RESOLUTION for the daemon; null = scanner default
   grayscale: false,
   keepStaging: false, // --keep-staging: on a SUCCESSFUL finish, keep raw scan_* pages
+  // MRC compression (opt-in). --mrc routes assembly through archive-pdf-tools'
+  // recode_pdf (JBIG2 bitonal text mask + downsampled JPEG2000 color background)
+  // for a much smaller searchable color PDF. See buildMrcPdf()/findRecodePdf().
+  mrc: false, // --mrc: use the MRC pipeline instead of img2pdf+ocrmypdf
+  mrcBgDownsample: 3, // --mrc-bg-downsample N: recode_pdf background downsample factor (>=1)
 };
 
 // ET-3700 advertises these DPI values; others pass through with a warning.
@@ -107,6 +112,8 @@ const state = {
   reencoder: "", // magick | sips | "" (none)
   hasJbig2: false,
   hasPngquant: false,
+  hasOpenjpeg: false, // opj_compress + opj_decompress present (MRC JP2 background)
+  recodePdf: "", // resolved recode_pdf path for the --mrc path ("" = not found)
   stagingReady: false, // true once staging dir created (safe to clean)
   stagedPages: [], // absolute paths accepted, in scan order
   finished: false, // true once finishBatch completed OK
@@ -150,6 +157,21 @@ PDF SIZE CONTROLS
                         through. Unset = scanner default.
   --grayscale           Convert pages to grayscale before assembly.
   --color-mode gray     Alias for --grayscale (gray|grayscale|color accepted).
+
+MRC COMPRESSION
+  --mrc                 Opt-in. Produce a much smaller searchable color PDF via
+                        MRC (archive-pdf-tools recode_pdf): a bitonal JBIG2 text
+                        mask over a downsampled JPEG2000 background. Best for
+                        many-page documents that must fit under email limits.
+                        Precedence: --mrc SUPERSEDES --quality (background
+                        downsample, not JPEG quality, controls size), composes
+                        with --grayscale (adds --grayscale-pdf), and IGNORES
+                        --optimize (recode_pdf already outputs an optimized PDF).
+                        Conflicts with --full-quality. Needs recode_pdf + jbig2;
+                        if recode_pdf is absent, scan-batch prints install steps.
+  --mrc-bg-downsample <n>
+                        Background downsample factor for --mrc (>=1). Higher =
+                        smaller + softer background. Default: 3.
 
 MODES
   --self-test           Run the offline self-test (no daemon, no scanner) and exit.
@@ -256,6 +278,13 @@ function parseArgs(argv) {
       }
       case "--keep-staging":
         cfg.keepStaging = true; break;
+      case "--mrc":
+        cfg.mrc = true; break;
+      case "--mrc-bg-downsample": {
+        const n = parseIntStrict(wantValue(args, i, a), a); i++;
+        if (n < 1) throw new ExitError(1, "--mrc-bg-downsample must be >= 1");
+        cfg.mrcBgDownsample = n; break;
+      }
       case "--version":
         log(versionString()); throw new ExitError(0);
       case "--self-test":
@@ -277,6 +306,14 @@ function parseArgs(argv) {
   }
   if (positionalOut) cfg.outDir = expandTilde(positionalOut);
   if (!cfg.staging) cfg.staging = path.join(cfg.outDir, ".work");
+
+  // --mrc and --full-quality are contradictory: MRC deliberately recompresses
+  // the background (lossy, downsampled) to shrink the file, which is the exact
+  // opposite of --full-quality's "preserve the raw scanner JPEG" promise.
+  if (cfg.mrc && cfg.fullQuality) {
+    throw new ExitError(1, "--mrc and --full-quality are contradictory (MRC recompresses to shrink; " +
+      "full-quality preserves the raw JPEG). Pick one.");
+  }
 
   if (cfg.dpi != null && !ADVERTISED_DPI.includes(cfg.dpi)) {
     warn(`--dpi ${cfg.dpi} is not an ET-3700 advertised value (${ADVERTISED_DPI.join("/")}); ` +
@@ -305,6 +342,42 @@ function run(cmd, cmdArgs, opts = {}) {
   // Synchronous external command; returns {status, stdout, stderr}.
   const r = spawnSync(cmd, cmdArgs, { encoding: "utf8", ...opts });
   return r;
+}
+
+// Locate recode_pdf (archive-pdf-tools) for the --mrc path. Checks, in order:
+//   (1) $SCAN_BATCH_RECODE_PDF (explicit override),
+//   (2) the dedicated venv at ~/.local/share/scan-batch-mrc/venv/bin/recode_pdf,
+//   (3) recode_pdf anywhere on PATH.
+// Returns the first existing path (or "recode_pdf" for the PATH case), else "".
+// All paths derive from os.homedir() — never a hardcoded /Users path.
+function findRecodePdf() {
+  const envPath = process.env.SCAN_BATCH_RECODE_PDF;
+  if (envPath) {
+    try { fs.accessSync(envPath, fs.constants.X_OK); return envPath; } catch { /* fall through */ }
+  }
+  const venvPath = path.join(HOME, ".local", "share", "scan-batch-mrc", "venv", "bin", "recode_pdf");
+  try { fs.accessSync(venvPath, fs.constants.X_OK); return venvPath; } catch { /* fall through */ }
+  if (have("recode_pdf")) return "recode_pdf";
+  return "";
+}
+
+// The copy-paste install block printed when --mrc is requested but recode_pdf
+// is missing. Built at runtime from os.homedir() so it never embeds a literal
+// /Users path. Mirrors the verified command set in the task context.
+function mrcInstallHelp() {
+  const venvDir = path.join(HOME, ".local", "share", "scan-batch-mrc", "venv");
+  const recode = path.join(venvDir, "bin", "recode_pdf");
+  return [
+    "--mrc needs archive-pdf-tools' recode_pdf, which is not installed.",
+    "Install it into a dedicated Python 3.13 virtualenv (one-time):",
+    "",
+    `  python3.13 -m venv "${venvDir}"`,
+    `  "${path.join(venvDir, "bin", "pip")}" install --upgrade pip wheel`,
+    `  "${path.join(venvDir, "bin", "pip")}" install archive-pdf-tools`,
+    "",
+    `recode_pdf will then live at: ${recode}`,
+    "(or set SCAN_BATCH_RECODE_PDF to an existing recode_pdf, or put it on PATH).",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +414,28 @@ function preflight() {
   // Optional optimizers for ocrmypdf --optimize 2/3.
   state.hasJbig2 = have("jbig2");
   state.hasPngquant = have("pngquant");
+
+  // MRC tooling detection (used whether or not --mrc is set, so the self-test
+  // can decide to run or SKIP the MRC smoke).
+  state.recodePdf = findRecodePdf();
+  state.hasOpenjpeg = have("opj_compress") && have("opj_decompress");
+
+  // When --mrc is requested, enforce its hard dependencies with actionable,
+  // non-hardcoded guidance. recode_pdf does the MRC work; jbig2 (jbig2enc) is
+  // required for the bitonal text mask. The JP2 background needs an OpenJPEG
+  // CLI (opj_compress/opj_decompress) OR, on the fallback JPEG path, jpegoptim.
+  if (cfg.mrc) {
+    if (!state.recodePdf) throw new ExitError(1, mrcInstallHelp());
+    if (!state.hasJbig2) {
+      throw new ExitError(1, "--mrc needs the jbig2 encoder for the bitonal text mask. " +
+        "Install with: brew install jbig2enc");
+    }
+    if (!state.hasOpenjpeg && !have("jpegoptim")) {
+      warn("--mrc background compression needs an OpenJPEG CLI (opj_compress/opj_decompress) " +
+        "or jpegoptim; neither was found. Install one with: brew install openjpeg  (or: brew install jpegoptim). " +
+        "If recode_pdf still fails, use the ocrmypdf-only fallback instead of --mrc.");
+    }
+  }
 
   fs.mkdirSync(cfg.outDir, { recursive: true });
   fs.mkdirSync(cfg.staging, { recursive: true });
@@ -529,6 +624,131 @@ function buildMergedPdf(pages, workDir) {
   return { mergedPdf: merged, pageCount: pages.length, fromPdf: false };
 }
 
+// ---------------------------------------------------------------------------
+// MRC path (opt-in, --mrc): archive-pdf-tools recode_pdf.
+//
+// recode_pdf builds the MRC PDF (JBIG2 bitonal text mask + downsampled JPEG2000
+// background) but does NOT OCR — searchability comes from a SINGLE multi-page
+// hOCR we generate with tesseract and feed via --hocr-file, mapped positionally
+// to the glob-sorted image stack. We name the stack page_0001.jpg.. so glob
+// order == scan order.
+//
+// Precedence/composition (also surfaced in --help):
+//   - --mrc SUPERSEDES --quality: we do NOT re-encode pages at cfg.quality here;
+//     recode_pdf's background downsample (--mrc-bg-downsample) controls size.
+//   - --mrc composes with --grayscale: pages are converted to gray AND
+//     recode_pdf is told --grayscale-pdf.
+//   - --optimize is IGNORED under --mrc (recode_pdf already outputs an optimized
+//     MRC/PDFA; ocrmypdf never runs on this path).
+//   - --mrc + --full-quality is rejected earlier in parseArgs().
+// ---------------------------------------------------------------------------
+
+// Prepare the recode_pdf image stack: one page_NNNN.jpg per input page, in scan
+// order, grayscale-converted when requested but NOT down-quality re-encoded
+// (recode_pdf governs final compression). Images are copied/grayscaled; PDF
+// pages are rasterized at 300 DPI (requires magick). Returns the stack paths.
+function buildMrcImageStack(pages, workDir) {
+  const stack = [];
+  pages.forEach((src, idx) => {
+    const kind = pageKind(src);
+    const dst = path.join(workDir, `page_${String(idx + 1).padStart(4, "0")}.jpg`);
+    if (kind === "pdf") {
+      if (state.reencoder !== "magick") {
+        throw new ExitError(4, "--mrc on PDF-format scans needs ImageMagick to rasterize pages " +
+          "(brew install imagemagick). Re-scan as JPEG, or drop --mrc.");
+      }
+      const a = ["-density", "300", `${src}[0]`];
+      if (cfg.grayscale) a.push("-colorspace", "Gray");
+      a.push("-units", "PixelsPerInch", "-density", "300", "-quality", "95", dst);
+      const r = run("magick", a);
+      if (r.status !== 0) throw new ExitError(4, `magick PDF rasterize (mrc) failed: ${(r.stderr || "").trim()}`);
+    } else if (cfg.grayscale && state.reencoder === "magick") {
+      const r = run("magick", [src, "-colorspace", "Gray", "-quality", "95", dst]);
+      if (r.status !== 0) throw new ExitError(4, `magick grayscale (mrc) failed: ${(r.stderr || "").trim()}`);
+    } else if (cfg.grayscale && state.reencoder === "sips") {
+      fs.copyFileSync(src, dst);
+      const r = run("sips", ["-m", "/System/Library/ColorSync/Profiles/Generic Gray Profile.icc", dst, "--out", dst]);
+      if (r.status !== 0) throw new ExitError(4, `sips grayscale (mrc) failed: ${(r.stderr || "").trim()}`);
+    } else {
+      // Color (default) and no re-encode: use the raw scanner JPEG as-is so the
+      // text mask is built from the sharpest available source.
+      fs.copyFileSync(src, dst);
+    }
+    stack.push(dst);
+  });
+  return stack;
+}
+
+// Generate ONE multi-page hOCR covering the glob-sorted image stack: run
+// tesseract's own `hocr` config per page, then concatenate the per-page bodies
+// into a single hOCR document whose <div class="ocr_page"> order matches the
+// stack. Using tesseract's native hOCR (not a third-party converter) avoids the
+// glyph-height/merge issues reported in archive-pdf-tools IA #37/#63/#69.
+function buildMrcHocr(stack, workDir) {
+  const perPageBodies = [];
+  let header = "";
+  stack.forEach((img, idx) => {
+    const base = path.join(workDir, `hocr_${String(idx + 1).padStart(4, "0")}`);
+    const r = run("tesseract", [img, base, "-l", cfg.ocrLangs, "hocr"]);
+    if (r.status !== 0) throw new ExitError(5, `tesseract hOCR failed on page ${idx + 1}: ${(r.stderr || "").trim()}`);
+    const hocrFile = `${base}.hocr`;
+    const txt = fs.readFileSync(hocrFile, "utf8");
+    if (!header) {
+      const hm = txt.match(/^([\s\S]*?)<body>/i);
+      header = hm ? hm[1] : "";
+    }
+    const bm = txt.match(/<body>([\s\S]*?)<\/body>/i);
+    perPageBodies.push(bm ? bm[1] : "");
+  });
+  if (!header) {
+    header = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" ' +
+      '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">\n' +
+      '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">\n' +
+      '<head><meta charset="utf-8"/></head>\n';
+  }
+  const merged = `${header}<body>\n${perPageBodies.join("\n")}\n</body>\n</html>\n`;
+  const mergedPath = path.join(workDir, `mrc_${process.pid}.hocr`);
+  fs.writeFileSync(mergedPath, merged);
+  return mergedPath;
+}
+
+// Build the final MRC PDF via recode_pdf. Throws ExitError(5) on recode failure
+// or if the resulting PDF has no real text layer (the known hOCR-merge
+// fragility guard — a missing text layer points the user at the non-MRC path).
+function buildMrcPdf(pages, workDir, outPath) {
+  const stack = buildMrcImageStack(pages, workDir);
+  const hocr = buildMrcHocr(stack, workDir);
+  const glob = path.join(workDir, "page_*.jpg");
+
+  const args = [
+    "--from-imagestack", glob,
+    "--hocr-file", hocr,
+    "--dpi", String(cfg.dpi || 300),
+    "--mask-compression", "jbig2",
+    "--mrc-image-format", "jpeg2000",
+    "--jpeg2000-implementation", "openjpeg",
+    "--bg-downsample", String(cfg.mrcBgDownsample),
+    "-o", outPath,
+  ];
+  if (cfg.grayscale) args.push("--grayscale-pdf");
+
+  const r = run(state.recodePdf, args, { stdio: ["ignore", "inherit", "inherit"] });
+  if (r.status !== 0 || !fs.existsSync(outPath)) {
+    throw new ExitError(5, "recode_pdf (MRC) failed. If this persists, retry without --mrc " +
+      "to use the standard ocrmypdf path." + (r.stderr ? ` Details: ${String(r.stderr).trim()}` : ""));
+  }
+
+  // Searchability guarantee: the MRC PDF MUST carry a real text layer. recode_pdf
+  // can silently drop the hOCR layer (IA #37/#63/#69), so verify with pdftotext.
+  const t = run("pdftotext", [outPath, "-"]);
+  if (t.status !== 0 || !(t.stdout || "").trim()) {
+    throw new ExitError(5, "MRC PDF has no searchable text layer (recode_pdf did not embed the hOCR). " +
+      "Retry without --mrc to use the standard ocrmypdf path, which guarantees searchability.");
+  }
+  return { outPath, pageCount: pages.length };
+}
+
 // The single finish path. `interactive` controls whether we prompt on stdin.
 async function finishBatch(pages, { interactive = true, presetName = null } = {}) {
   const sorted = pages.slice().sort();
@@ -552,6 +772,22 @@ async function finishBatch(pages, { interactive = true, presetName = null } = {}
   if (!name) name = timestampName();
 
   const outPath = resolveOutputPath(name);
+
+  // MRC path (opt-in): recode_pdf builds + makes the PDF searchable in one shot
+  // (its own JBIG2 mask + JP2 background + embedded hOCR text layer), so it
+  // replaces the img2pdf+ocrmypdf path entirely. --optimize is intentionally
+  // ignored here (recode_pdf already outputs an optimized MRC PDF).
+  if (cfg.mrc) {
+    log(`Assembling ${sorted.length} page(s) via MRC (recode_pdf: JBIG2 mask + JP2 bg, ` +
+      `downsample ${cfg.mrcBgDownsample}${cfg.grayscale ? ", grayscale" : ""})...`);
+    buildMrcPdf(sorted, cfg.staging, outPath);
+    log("");
+    log(`Done. Searchable PDF (${sorted.length} page(s)) written to:`);
+    log(`  ${outPath}`);
+    state.runStatus = "ok";
+    state.finished = true;
+    return { outPath, pageCount: sorted.length };
+  }
 
   log(`Assembling ${sorted.length} page(s) into a PDF (${state.assembler}` +
     `${cfg.fullQuality ? ", full quality" : `, q${cfg.quality}`}` +
@@ -649,6 +885,8 @@ function cleanStaging() {
     if (/^scan_.*\.(jpg|jpeg|pdf)$/i.test(e) ||
         /^page_\d+\.jpg$/i.test(e) ||
         /^merged_.*\.pdf$/i.test(e) ||
+        /^hocr_\d+\.hocr$/i.test(e) ||
+        /^mrc_.*\.hocr$/i.test(e) ||
         e === "daemon.log") {
       try { fs.rmSync(path.join(cfg.staging, e), { force: true }); } catch { /* ignore */ }
     }
@@ -1271,6 +1509,49 @@ async function selfTest() {
   log("");
   log("[10/10] --help lists new size-control flags");
   assert(true, "help text includes --quality/--full-quality/--optimize/--dpi/--grayscale (see --help)");
+
+  // --- [MRC] MRC smoke: run the real --mrc path IF recode_pdf is installed,
+  // else SKIP cleanly so the self-test still passes on a bare machine. Synthetic
+  // plasma pages are allowed HERE ONLY (never for README size claims); we assert
+  // the output exists, has N pages, and carries a real text layer (pdftotext),
+  // NOT any absolute KB target (real size numbers come from the real-page run).
+  log("");
+  log("[MRC] MRC smoke (recode_pdf path end-to-end, or SKIP if not installed)");
+  if (!state.recodePdf) {
+    assert(true, "SKIP MRC smoke (recode_pdf not installed; run --mrc for install commands)");
+  } else if (!have("magick")) {
+    assert(true, "SKIP MRC smoke (needs magick to synthesize test pages)");
+  } else {
+    fs.mkdirSync(cfg.staging, { recursive: true });
+    const mp = [
+      path.join(cfg.staging, "scan_2026-06-06_000001.jpg"),
+      path.join(cfg.staging, "scan_2026-06-06_000002.jpg"),
+    ];
+    let built = true;
+    mp.forEach((jpg, i) => { if (!makeRealPageJpeg(jpg, i + 20)) built = false; });
+    if (!built) {
+      assert(false, "generate synthetic MRC smoke pages (magick)");
+    } else {
+      const savedMrc = cfg.mrc;
+      cfg.mrc = true;
+      state.stagedPages = mp.slice();
+      let mrcOut = null;
+      try {
+        const res = await finishBatch(mp, { interactive: false, presetName: "selftest-mrc" });
+        mrcOut = res.outPath;
+      } catch (e) { assert(false, `MRC smoke finishBatch threw: ${e.message}`); }
+      cfg.mrc = savedMrc;
+      if (mrcOut && fs.existsSync(mrcOut)) {
+        assert(pdfPageCount(mrcOut) === 2, "MRC smoke: output has 2 pages (pdfinfo)");
+        assert(run("pdftotext", [mrcOut, "-"]).status === 0,
+          "MRC smoke: searchable text layer present (pdftotext status 0)");
+        log(`  MEASURED (MRC smoke, synthetic): ${fmtBytes(fs.statSync(mrcOut).size)} total ` +
+          "(synthetic plasma pages are NOT representative; real sizes come from a real-page run)");
+      } else {
+        assert(false, "MRC smoke: output PDF created");
+      }
+    }
+  }
 
   // Clean up temp root entirely.
   try { fs.rmSync(td, { recursive: true, force: true }); } catch { /* ignore */ }
