@@ -66,32 +66,40 @@ const cfg = {
   dpi: null, // SCAN_RESOLUTION for the daemon; null = scanner default
   grayscale: false,
   keepStaging: false, // --keep-staging: on a SUCCESSFUL finish, keep raw scan_* pages
-  // MRC compression (opt-in). --mrc routes assembly through archive-pdf-tools'
-  // recode_pdf (JBIG2 bitonal text mask + downsampled JPEG2000 color background)
-  // for a much smaller searchable color PDF. See buildMrcPdf()/findRecodePdf().
-  mrc: false, // --mrc: use the MRC pipeline instead of img2pdf+ocrmypdf
-  mrcBgDownsample: 3, // --mrc-bg-downsample N: recode_pdf background downsample factor (>=1)
-  // --mrc-fallback: force the guaranteed-installable ocrmypdf --optimize 3 MRC
-  // fallback (JBIG2 bitonal mask via jbig2enc + pngquant color quantization)
-  // even when recode_pdf IS installed. The fallback is ALSO used automatically
-  // when --mrc is set but recode_pdf is absent, or when a recode_pdf run fails
-  // / yields no text layer (see FALLBACK_FAILURE_POLICY below).
+  // MRC compression is the DEFAULT (the tool's purpose is email-sized multipage
+  // scans). The default path OCRs the full-resolution page, then downsamples only
+  // the DISPLAYED image to ~1.5x (color), yielding a small searchable color PDF.
+  // Opt OUT to full resolution with --no-mrc, --quality N, or --full-quality.
+  // When recode_pdf is installed it is used for even better size; otherwise the
+  // full-res-OCR + Ghostscript downsample path runs. See buildMrcFallbackPdf().
+  mrc: true, // default MRC on; --no-mrc / --quality / --full-quality opt out
+  // --mrc-bg-downsample N (>=1, fractional allowed): factor by which the DISPLAYED
+  // image is downsampled for size. Default 1.5 = the approved "color 1.5x" profile
+  // (~200 dpi / ~1651x2333 from a 300-dpi page): sharper than the ds50 floor, under
+  // the email ceiling for 10-13 pages. 2 = ~150 dpi (smaller). CRITICAL: this only
+  // shrinks the DISPLAY image — OCR always runs on the FULL-RESOLUTION page first,
+  // so the small-text layer stays complete (see buildMrcFallbackPdf).
+  mrcBgDownsample: 1.5,
+  // --mrc-fallback: force the guaranteed-installable full-res-OCR + Ghostscript
+  // downsample MRC fallback (OCR the crisp full-res page, then shrink only the
+  // display image) even when recode_pdf IS installed. The fallback is ALSO used
+  // automatically when --mrc is set but recode_pdf is absent, or when a
+  // recode_pdf run fails / yields no text layer (see FALLBACK_FAILURE_POLICY).
   mrcFallback: false,
 };
 
-// Pre-pass JPEG/PNG quality used by the ocrmypdf --optimize 3 MRC fallback. A
-// moderate cap (~75) that is visually clean on document scans while letting
-// --optimize 3 do the heavy lossless-image reduction (jbig2enc text mask +
-// pngquant color). Kept as a constant (not a flag) to keep the fallback a
-// predictable, documented size path; --mrc-bg-downsample still tunes the
-// background downsample applied before OCR.
-const MRC_FALLBACK_QUALITY = 75;
+// JPEG quality for the FULL-RESOLUTION page handed to Tesseract in the MRC
+// fallback. Kept HIGH (q92) so OCR sees a crisp original and captures small
+// (and small colored) text completely — the display image is shrunk later by a
+// separate, text-preserving Ghostscript pass, so this quality does not drive the
+// final file size (--mrc-bg-downsample does).
+const MRC_FULLRES_OCR_QUALITY = 92;
 
 // FALLBACK_FAILURE_POLICY (the ONE documented behavior, surfaced in --help):
 // when --mrc selects the recode_pdf path and that run FAILS or produces no
 // searchable text layer, scan-batch does NOT hard-fail. It AUTO-FALLS BACK to
-// buildMrcFallbackPdf (the ocrmypdf --optimize 3 path), which needs no
-// recode_pdf and is guaranteed searchable, and notes the fallback in the log.
+// buildMrcFallbackPdf (the full-res-OCR + Ghostscript downsample path), which
+// needs no recode_pdf and is guaranteed searchable, and notes it in the log.
 // Rationale: the user's goal is a small, searchable PDF under the email ceiling;
 // erroring out when a guaranteed-installable fallback exists is worse UX than
 // silently-correct degradation, and recode_pdf's hOCR merge is the known-fragile
@@ -137,6 +145,7 @@ const state = {
   reencoder: "", // magick | sips | "" (none)
   hasJbig2: false,
   hasPngquant: false,
+  hasGs: false, // ghostscript present (used to downsample the MRC display image)
   hasOpenjpeg: false, // opj_compress + opj_decompress present (MRC JP2 background)
   recodePdf: "", // resolved recode_pdf path for the --mrc path ("" = not found)
   stagingReady: false, // true once staging dir created (safe to clean)
@@ -168,49 +177,59 @@ OUTPUT / PATHS
                         Default: ~/Dev/epson2paperless
   --langs <langs>       OCR languages for ocrmypdf -l. Default: deu+eng
 
-PDF SIZE CONTROLS
-  --quality <1-100>     Re-encode each page JPEG at this quality during assembly.
-                        Default: 70. q70 color is visually clean on document
-                        scans and ~halves size vs the scanner's native q90 JPEG.
-  --full-quality        Skip re-encode; preserve the raw scanner JPEG. Use for
-                        photos/maps where re-encode artifacts matter.
-  --optimize <0-3>      Pass to ocrmypdf --optimize N. 0 = off (default).
-                        2/3 need jbig2enc/pngquant; if absent, falls back to the
-                        highest supported level with a warning.
+QUALITY LADDER (default = MRC color 1.5x, email-sized + searchable)
+  By default (no flag) scan-batch produces an MRC color 1.5x PDF: it OCRs the
+  FULL-RESOLUTION page, then downsamples only the DISPLAYED image to ~1651x2333
+  (~200 dpi). Small (and small COLORED) text stays in the searchable text layer;
+  the file is email-sized (~3.1 MB for 13 color pages). Tune or opt out:
+  --mrc-bg-downsample 1 = sharper (full-res image, bigger) for tiny/colored print;
+  --mrc-bg-downsample 2 = smaller (~150 dpi); --grayscale = smallest (caveat below);
+  --no-mrc / --quality N / --full-quality = opt out to full RESOLUTION.
+
+  --no-mrc              Opt out of the default MRC. Use the full-resolution path:
+                        a q70 (or --quality N) JPEG re-encode, OCR'd, no display
+                        downsample. Crisp + larger; good when every pixel matters.
+  --quality <1-100>     Full-resolution JPEG re-encode at this quality (implies
+                        --no-mrc). Default: 70. Higher = sharper + bigger.
+  --full-quality        Full-resolution, no re-encode; raw scanner JPEG (implies
+                        --no-mrc). Max fidelity, biggest. For photos/maps.
+  --optimize <0-3>      Pass to ocrmypdf --optimize N on the --no-mrc path.
+                        0 = off (default). 2/3 need jbig2enc/pngquant.
   --dpi <n>             Scan resolution (SCAN_RESOLUTION) for the daemon.
                         ET-3700 advertises 75/150/300/600; others warn and pass
                         through. Unset = scanner default.
-  --grayscale           Convert pages to grayscale before assembly.
+  --grayscale           Convert pages to grayscale. Smaller, but see the CAVEAT.
   --color-mode gray     Alias for --grayscale (gray|grayscale|color accepted).
 
-MRC COMPRESSION
-  --mrc                 Opt-in. Produce a much smaller searchable color PDF via
-                        MRC (archive-pdf-tools recode_pdf): a bitonal JBIG2 text
-                        mask over a downsampled JPEG2000 background. Best for
-                        many-page documents that must fit under email limits.
-                        Precedence: --mrc SUPERSEDES --quality (background
-                        downsample, not JPEG quality, controls size), composes
-                        with --grayscale (adds --grayscale-pdf), and IGNORES
-                        --optimize (recode_pdf already outputs an optimized PDF).
-                        Conflicts with --full-quality. Uses recode_pdf when
-                        installed; otherwise auto-uses the --mrc-fallback path
-                        below (see 'Fallback behavior').
+MRC (the default pipeline)
+  --mrc                 Re-enable the default MRC pipeline (useful after a
+                        --quality/--no-mrc on the same command line). MRC OCRs the
+                        FULL-RESOLUTION page FIRST (small/colored text captured
+                        completely), then downsamples only the DISPLAYED image.
+                        Composes with --grayscale (smaller — see CAVEAT), IGNORES
+                        --optimize, and conflicts with --full-quality. Uses
+                        recode_pdf for best size when installed; otherwise the
+                        fallback below runs automatically.
+                        GRAYSCALE CAVEAT: --grayscale collapses colored small print
+                        (e.g. red stamps/notices) toward mid-gray and can HURT its
+                        OCR/legibility. Color is the default; use --grayscale only
+                        for black-text-only documents.
   --mrc-bg-downsample <n>
-                        Background downsample factor for the --mrc background
-                        (>=1). Higher = smaller + softer background. Default: 3.
-                        Also controls the fallback's pre-OCR background downsample.
-  --mrc-fallback        Force the guaranteed-installable MRC fallback: assemble
-                        the pages then OCR with 'ocrmypdf --optimize 3' (JBIG2
-                        bitonal text mask via jbig2enc + pngquant color), which
-                        needs NO recode_pdf. Implies --mrc. Still a SEARCHABLE,
-                        smaller color PDF; degrades with a warning (not an error)
-                        if jbig2enc/pngquant are absent.
+                        Factor by which the DISPLAYED image is downsampled (>=1,
+                        fractional OK). OCR is ALWAYS full-resolution regardless.
+                        Default: 1.5 (~200 dpi). 1 = full-res image (sharpest,
+                        biggest); 2 = ~150 dpi (smaller/softer).
+  --mrc-fallback        Force the guaranteed-installable MRC fallback: OCR the
+                        full-resolution page, then downsample only the display
+                        image with Ghostscript. Needs NO recode_pdf (only ocrmypdf
+                        + gs). Implies --mrc. Still a SEARCHABLE color PDF; if gs is
+                        absent it stays full-resolution (searchable) with a warning.
 
   Fallback behavior: --mrc normally uses recode_pdf when it is installed. If
   recode_pdf is NOT installed, OR a recode_pdf run fails / produces no text
-  layer, scan-batch does NOT error out — it AUTOMATICALLY uses the ocrmypdf
-  --optimize 3 fallback above (still searchable) and notes it in the log. Use
-  --mrc-fallback to force that path even when recode_pdf is present.
+  layer, scan-batch does NOT error out — it AUTOMATICALLY uses the full-res-OCR +
+  Ghostscript downsample fallback above (still searchable) and notes it in the
+  log. Use --mrc-fallback to force that path even when recode_pdf is present.
 
 MODES
   --self-test           Run the offline self-test (no daemon, no scanner) and exit.
@@ -273,6 +292,11 @@ function parseIntStrict(v, flag) {
   return parseInt(v, 10);
 }
 
+function parseFloatStrict(v, flag) {
+  if (!/^-?\d+(\.\d+)?$/.test(v)) throw new ExitError(1, `${flag} needs a number, got '${v}'`);
+  return parseFloat(v);
+}
+
 function parseArgs(argv) {
   const args = argv.slice();
   let positionalOut = "";
@@ -292,10 +316,16 @@ function parseArgs(argv) {
       case "--quality": {
         const q = parseIntStrict(wantValue(args, i, a), a); i++;
         if (q < 1 || q > 100) throw new ExitError(1, "--quality must be 1-100");
-        cfg.quality = q; cfg.fullQuality = false; break;
+        // Asking for a JPEG re-encode quality means the full-resolution (non-MRC)
+        // path. Opt out of the default MRC unless --mrc is given explicitly later.
+        cfg.quality = q; cfg.fullQuality = false; cfg.mrc = false; break;
       }
       case "--full-quality":
-        cfg.fullQuality = true; break;
+        // Raw full-resolution page: the non-MRC path. Opt out of default MRC.
+        cfg.fullQuality = true; cfg.mrc = false; break;
+      case "--no-mrc":
+        // Explicit opt-out: use the full-resolution q70 (non-MRC) path.
+        cfg.mrc = false; cfg.mrcFallback = false; break;
       case "--optimize": {
         const o = parseIntStrict(wantValue(args, i, a), a); i++;
         if (o < 0 || o > 3) throw new ExitError(1, "--optimize must be 0-3");
@@ -320,7 +350,7 @@ function parseArgs(argv) {
       case "--mrc":
         cfg.mrc = true; break;
       case "--mrc-bg-downsample": {
-        const n = parseIntStrict(wantValue(args, i, a), a); i++;
+        const n = parseFloatStrict(wantValue(args, i, a), a); i++;
         if (n < 1) throw new ExitError(1, "--mrc-bg-downsample must be >= 1");
         cfg.mrcBgDownsample = n; break;
       }
@@ -457,6 +487,7 @@ function preflight() {
   // Optional optimizers for ocrmypdf --optimize 2/3.
   state.hasJbig2 = have("jbig2");
   state.hasPngquant = have("pngquant");
+  state.hasGs = have("gs");
 
   // MRC tooling detection (used whether or not --mrc is set, so the self-test
   // can decide to run or SKIP the MRC smoke).
@@ -464,31 +495,32 @@ function preflight() {
   state.hasOpenjpeg = have("opj_compress") && have("opj_decompress");
 
   // When --mrc is requested, decide between the recode_pdf path and the
-  // guaranteed-installable ocrmypdf --optimize 3 fallback (FEAT-003). The
-  // fallback needs NO recode_pdf — only ocrmypdf (already required above) plus,
-  // for best size, jbig2enc + pngquant (which degrade gracefully). So MRC never
+  // guaranteed-installable full-res-OCR + Ghostscript downsample fallback
+  // (FEAT-003/004). The fallback needs NO recode_pdf — only ocrmypdf (already
+  // required above) plus ghostscript for the display shrink (degrades gracefully
+  // to full-resolution if gs is absent). So MRC never
   // hard-fails on a missing recode_pdf: if recode_pdf is absent (or the user
   // forced --mrc-fallback), we route to the fallback with a one-line notice.
   if (cfg.mrc) {
     const useFallback = cfg.mrcFallback || !state.recodePdf;
     if (useFallback) {
       if (cfg.mrcFallback) {
-        log("--mrc-fallback: using the ocrmypdf --optimize 3 MRC fallback " +
-          "(still searchable; needs no recode_pdf).");
+        log("--mrc-fallback: using the full-res-OCR + Ghostscript downsample MRC " +
+          "fallback (still searchable; needs no recode_pdf).");
       } else {
         // recode_pdf absent but --mrc requested: auto-use the fallback, and
         // point the user at the better-compressing recode_pdf install (optional).
-        warn("recode_pdf not found; using the ocrmypdf --optimize 3 MRC fallback " +
-          "(still searchable; install archive-pdf-tools for best size — see --help).");
+        warn("recode_pdf not found; using the full-res-OCR + Ghostscript downsample " +
+          "MRC fallback (still searchable; install archive-pdf-tools for best size — see --help).");
       }
-      // The fallback's heavy lifting is ocrmypdf --optimize 3: jbig2enc for the
-      // bitonal text mask + pngquant for color. Missing either only degrades the
-      // optimize level (see effectiveMrcFallbackOptimize), never errors.
-      if (!state.hasJbig2 || !state.hasPngquant) {
-        const miss = [!state.hasJbig2 ? "jbig2enc" : null, !state.hasPngquant ? "pngquant" : null]
-          .filter(Boolean).join(" + ");
-        warn(`MRC fallback size is best with jbig2enc + pngquant; ${miss} missing. ` +
-          "The PDF is still searchable but larger. Install with: brew install jbig2enc pngquant");
+      // The fallback OCRs the FULL-RESOLUTION page (complete small-text layer),
+      // then downsamples only the DISPLAY image with Ghostscript for size. Only
+      // gs is needed beyond ocrmypdf (already required). Without gs the output is
+      // still searchable, just full-resolution/larger (shrinkPdfImages warns).
+      if (!state.hasGs) {
+        warn("MRC fallback shrinks the display image with ghostscript (gs), which is not " +
+          "found. The PDF is still searchable but stays full-resolution/larger. " +
+          "Install with: brew install ghostscript");
       }
     } else {
       // recode_pdf path. jbig2 (jbig2enc) is required for the bitonal text mask;
@@ -502,7 +534,7 @@ function preflight() {
       if (!state.hasOpenjpeg && !have("jpegoptim")) {
         warn("--mrc background compression needs an OpenJPEG CLI (opj_compress/opj_decompress) " +
           "or jpegoptim; neither was found. Install one with: brew install openjpeg  (or: brew install jpegoptim). " +
-          "If recode_pdf fails, scan-batch auto-uses the ocrmypdf --optimize 3 fallback.");
+          "If recode_pdf fails, scan-batch auto-uses the full-res-OCR + Ghostscript downsample fallback.");
       }
     }
   }
@@ -638,22 +670,6 @@ function effectiveOptimize() {
     warn(`--optimize ${n}: ${miss} missing; ocrmypdf will apply what it can at this level.`);
   }
   return n;
-}
-
-// The effective ocrmypdf --optimize level for the MRC fallback. The fallback
-// TARGETS --optimize 3 (the most aggressive lossless-image reduction: jbig2enc
-// bitonal text mask + pngquant color quantization). If both optimizers are
-// missing it degrades to --optimize 1 with a warning; if only one is missing it
-// still requests 3 and lets ocrmypdf apply what it can — mirroring
-// effectiveOptimize()'s graceful degradation, so the fallback never fails on a
-// missing optimizer.
-function effectiveMrcFallbackOptimize() {
-  if (!state.hasJbig2 && !state.hasPngquant) {
-    warn("MRC fallback: jbig2enc + pngquant both missing; dropping to --optimize 1 " +
-      "(searchable, but larger). Install with: brew install jbig2enc pngquant");
-    return 1;
-  }
-  return 3;
 }
 
 // Build the merged (pre-OCR) PDF from staged pages, applying size controls.
@@ -814,7 +830,10 @@ function buildMrcPdf(pages, workDir, outPath) {
     "--mask-compression", "jbig2",
     "--mrc-image-format", "jpeg2000",
     "--jpeg2000-implementation", "openjpeg",
-    "--bg-downsample", String(cfg.mrcBgDownsample),
+    // recode_pdf's --bg-downsample is an integer factor; round the (possibly
+    // fractional) cfg value to the nearest >=1 integer for this path. The
+    // ocrmypdf fallback uses the fractional value directly as a target DPI.
+    "--bg-downsample", String(Math.max(1, Math.round(cfg.mrcBgDownsample))),
     "-o", outPath,
   ];
   if (cfg.grayscale) args.push("--grayscale-pdf");
@@ -836,34 +855,45 @@ function buildMrcPdf(pages, workDir, outPath) {
 }
 
 // ---------------------------------------------------------------------------
-// MRC FALLBACK (FEAT-003): guaranteed-installable, needs NO recode_pdf.
+// MRC FALLBACK (FEAT-003/FEAT-004): guaranteed-installable, needs NO recode_pdf.
 //
-// Assemble the per-page JPEGs (img2pdf, honoring --grayscale and a moderate
-// MRC_FALLBACK_QUALITY pre-pass, plus an optional --mrc-bg-downsample 300->DPI
-// background downsample) then run `ocrmypdf -l <langs> --optimize 3
-// --jpeg-quality <q> --png-quality <q>`. ocrmypdf's --optimize 3 performs a
-// real MRC-like reduction with the already-installed jbig2enc (bitonal text
-// mask) + pngquant (color), and because ocrmypdf runs genuine OCR the output is
-// ALWAYS searchable. This is the safety net for recode_pdf's hOCR-merge
-// fragility and for machines where archive-pdf-tools cannot be installed.
+// THE PIPELINE ORDER IS THE WHOLE POINT. OCR runs on the FULL-RESOLUTION page
+// FIRST, THEN only the DISPLAYED image is downsampled. An earlier version
+// downsampled before OCR, which fed Tesseract a low-res page and dropped small
+// (and small colored) text from the text layer. By OCR'ing at full 300-DPI
+// resolution we keep the complete small-text layer (verified: real ET-3700
+// pages recover full-res token capture), while Ghostscript shrinks ONLY the
+// visible image afterward for email-sized output. The text layer is unchanged
+// by the shrink pass.
+//
+// Steps:
+//   1. assembleImages() the FULL-RES per-page JPEGs (no pre-OCR downsample;
+//      --grayscale converts to gray here — opt-in, see caveat).
+//   2. ocrmypdf -l <langs> --optimize 0 on the full-res merged PDF => complete
+//      searchable text layer from the crisp original.
+//   3. Ghostscript downsamples ONLY the image streams to a target DPI derived
+//      from --mrc-bg-downsample (300 / factor; default 1.5 => ~200 dpi), leaving
+//      the OCR text layer intact. If gs is unavailable, keep the full-res OCR'd
+//      PDF (searchable, just larger) with a warning.
 //
 // Precedence/composition (mirrors the recode_pdf --mrc path):
-//   - SUPERSEDES --quality: the fallback uses its own MRC_FALLBACK_QUALITY cap +
-//     --optimize 3, not cfg.quality.
-//   - composes with --grayscale (pages converted to gray before assembly).
-//   - --mrc-bg-downsample N (N>1) downsamples the raster by N before OCR for a
-//     smaller/softer background, consistent with the recode_pdf --bg-downsample.
-// Throws ExitError on assemble/OCR failure or (as a parity guard with the
-// recode_pdf path) if pdftotext finds no text layer after the run.
+//   - SUPERSEDES --quality: size is governed by --mrc-bg-downsample, not cfg.quality.
+//   - composes with --grayscale (pages gray before OCR+assembly). CAVEAT: grayscale
+//     collapses colored small print (e.g. red stamps/notices) toward mid-gray and
+//     can HURT its OCR/legibility — color is the safer default; grayscale is best
+//     for black-text-only documents.
+//   - --mrc-bg-downsample FACTOR tunes the DISPLAY image size only (OCR is always
+//     full-res). Default 1.5; 2 = smaller/softer.
+// Throws ExitError on assemble/OCR failure or (parity guard) if pdftotext finds
+// no text layer after the run.
 // ---------------------------------------------------------------------------
 
-// Prepare the fallback image stack: one page_NNNN.jpg per input page in scan
-// order, grayscale-converted when requested, re-encoded at MRC_FALLBACK_QUALITY,
-// and (when --mrc-bg-downsample > 1) resized to 1/N for a smaller background.
-// PDF-format pages are rasterized at 300 DPI (requires magick). Returns paths.
+// Prepare the FULL-RESOLUTION image stack: one page_NNNN.jpg per input page in
+// scan order, grayscale-converted when requested, re-encoded at a high quality
+// so OCR sees a crisp page. NO downsampling here — the display shrink happens
+// AFTER OCR in buildMrcFallbackPdf(). PDF-format pages are rasterized at 300 DPI
+// (requires magick). Returns paths.
 function buildMrcFallbackStack(pages, workDir) {
-  const ds = cfg.mrcBgDownsample > 1 ? cfg.mrcBgDownsample : 1;
-  const resizePct = ds > 1 ? String(Math.round(100 / ds)) + "%" : null;
   const stack = [];
   pages.forEach((src, idx) => {
     const dst = path.join(workDir, `page_${String(idx + 1).padStart(4, "0")}.jpg`);
@@ -875,22 +905,18 @@ function buildMrcFallbackStack(pages, workDir) {
       }
       const a = ["-density", "300", `${src}[0]`];
       if (cfg.grayscale) a.push("-colorspace", "Gray");
-      if (resizePct) a.push("-resize", resizePct);
-      a.push("-units", "PixelsPerInch", "-density", "300", "-quality", String(MRC_FALLBACK_QUALITY), dst);
+      a.push("-units", "PixelsPerInch", "-density", "300", "-quality", String(MRC_FULLRES_OCR_QUALITY), dst);
       const r = run("magick", a);
       if (r.status !== 0) throw new ExitError(4, `magick PDF rasterize (mrc fallback) failed: ${(r.stderr || "").trim()}`);
     } else if (state.reencoder === "magick") {
       const a = [src];
       if (cfg.grayscale) a.push("-colorspace", "Gray");
-      if (resizePct) a.push("-resize", resizePct);
-      a.push("-quality", String(MRC_FALLBACK_QUALITY), dst);
+      a.push("-quality", String(MRC_FULLRES_OCR_QUALITY), dst);
       const r = run("magick", a);
       if (r.status !== 0) throw new ExitError(4, `magick re-encode (mrc fallback) failed: ${(r.stderr || "").trim()}`);
     } else if (state.reencoder === "sips") {
-      // sips can re-encode/quality + grayscale, but cannot downsample by factor
-      // cleanly here; honor quality + grayscale and skip the resize (documented).
       fs.copyFileSync(src, dst);
-      const a = ["-s", "format", "jpeg", "-s", "formatOptions", String(MRC_FALLBACK_QUALITY)];
+      const a = ["-s", "format", "jpeg", "-s", "formatOptions", String(MRC_FULLRES_OCR_QUALITY)];
       if (cfg.grayscale) a.push("-m", "/System/Library/ColorSync/Profiles/Generic Gray Profile.icc");
       a.push(dst, "--out", dst);
       const r = run("sips", a);
@@ -904,7 +930,41 @@ function buildMrcFallbackStack(pages, workDir) {
   return stack;
 }
 
-// Build the final MRC-fallback PDF: img2pdf assemble -> ocrmypdf --optimize 3.
+// Downsample ONLY the image streams of an OCR'd PDF to targetDpi with Ghostscript,
+// preserving the (full-res-derived) text layer. Writes to a temp file then moves
+// it over outPath. Returns true on success, false if gs is absent/failed (caller
+// then keeps the full-res OCR'd PDF — searchable, just larger).
+function shrinkPdfImages(outPath, targetDpi) {
+  if (!state.hasGs) {
+    warn("ghostscript (gs) not found; keeping the full-resolution OCR'd PDF " +
+      "(searchable, but larger). Install with: brew install ghostscript");
+    return false;
+  }
+  const tmp = `${outPath}.shrink_${process.pid}.pdf`;
+  const dpi = String(Math.max(72, Math.round(targetDpi)));
+  const gsArgs = [
+    "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5", "-dNOPAUSE", "-dBATCH", "-dQUIET",
+    "-dColorImageDownsampleThreshold=1.0", "-dGrayImageDownsampleThreshold=1.0",
+    "-dDownsampleColorImages=true", `-dColorImageResolution=${dpi}`, "-dColorImageDownsampleType=/Bicubic",
+    "-dDownsampleGrayImages=true", `-dGrayImageResolution=${dpi}`, "-dGrayImageDownsampleType=/Bicubic",
+    "-dAutoFilterColorImages=false", "-dColorImageFilter=/DCTEncode",
+    "-dAutoFilterGrayImages=false", "-dGrayImageFilter=/DCTEncode", "-dJPEGQ=82",
+    `-sOutputFile=${tmp}`, outPath,
+  ];
+  const r = run("gs", gsArgs);
+  if (r.status !== 0 || !fs.existsSync(tmp)) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    warn(`ghostscript image downsample failed; keeping the full-resolution OCR'd PDF.` +
+      (r.stderr ? ` Details: ${String(r.stderr).trim()}` : ""));
+    return false;
+  }
+  try { fs.renameSync(tmp, outPath); } catch { fs.copyFileSync(tmp, outPath); fs.rmSync(tmp, { force: true }); }
+  return true;
+}
+
+// Build the final MRC-fallback PDF via the OCR-FULL-RES-THEN-DOWNSAMPLE pipeline:
+// assemble full-res -> ocrmypdf --optimize 0 (full-res OCR) -> gs downsample the
+// DISPLAY image to (300 / --mrc-bg-downsample) dpi, keeping the text layer.
 // Always searchable (ocrmypdf OCRs). Asserts a text layer with pdftotext for
 // parity with the recode_pdf path's guard. Throws ExitError on failure.
 function buildMrcFallbackPdf(pages, workDir, outPath) {
@@ -912,10 +972,9 @@ function buildMrcFallbackPdf(pages, workDir, outPath) {
   const merged = path.join(workDir, `mrcfb_merged_${process.pid}.pdf`);
   assembleImages(stack, merged);
 
-  const optN = effectiveMrcFallbackOptimize();
-  const ocrArgs = ["-l", cfg.ocrLangs, "--optimize", String(optN),
-    "--jpeg-quality", String(MRC_FALLBACK_QUALITY), "--png-quality", String(MRC_FALLBACK_QUALITY),
-    merged, outPath];
+  // Full-resolution OCR (--optimize 0: do NOT let ocrmypdf downsample before/at
+  // OCR; the display shrink is a separate, text-preserving gs pass below).
+  const ocrArgs = ["-l", cfg.ocrLangs, "--optimize", "0", merged, outPath];
   const r = run("ocrmypdf", ocrArgs, { stdio: ["ignore", "inherit", "inherit"] });
   try { fs.rmSync(merged, { force: true }); } catch { /* ignore */ }
   if (r.status !== 0 || !fs.existsSync(outPath)) {
@@ -923,8 +982,11 @@ function buildMrcFallbackPdf(pages, workDir, outPath) {
       (r.stderr ? ` Details: ${String(r.stderr).trim()}` : ""));
   }
 
-  // Parity guard with the recode_pdf path: assert a real text layer. ocrmypdf
-  // OCRs so this is intrinsic, but we verify to catch an empty-OCR edge case.
+  // Shrink ONLY the display image to the target DPI (text layer untouched).
+  const targetDpi = 300 / (cfg.mrcBgDownsample >= 1 ? cfg.mrcBgDownsample : 1);
+  shrinkPdfImages(outPath, targetDpi);
+
+  // Parity guard with the recode_pdf path: assert a real text layer survived.
   const t = run("pdftotext", [outPath, "-"]);
   if (t.status !== 0 || !(t.stdout || "").trim()) {
     throw new ExitError(5, "MRC fallback PDF has no searchable text layer (unexpected — ocrmypdf OCRs). " +
@@ -960,8 +1022,8 @@ async function finishBatch(pages, { interactive = true, presetName = null } = {}
   // MRC path (opt-in): replaces the img2pdf+ocrmypdf path entirely. Two routes:
   //   (A) recode_pdf (best size): its own JBIG2 mask + JP2 background + embedded
   //       hOCR text layer. --optimize is ignored (recode_pdf outputs optimized).
-  //   (B) ocrmypdf --optimize 3 fallback (FEAT-003): guaranteed-installable, no
-  //       recode_pdf, always searchable.
+  //   (B) full-res-OCR + Ghostscript image-downsample fallback (FEAT-003/004):
+  //       guaranteed-installable, no recode_pdf, always searchable.
   // Selection + FALLBACK_FAILURE_POLICY (see top-of-file constant): use the
   // fallback when forced (--mrc-fallback) or when recode_pdf is absent. When the
   // recode_pdf route is attempted but FAILS or yields no text layer, we do NOT
@@ -969,9 +1031,9 @@ async function finishBatch(pages, { interactive = true, presetName = null } = {}
   if (cfg.mrc) {
     const forceFallback = cfg.mrcFallback || !state.recodePdf;
     if (forceFallback) {
-      log(`Assembling ${sorted.length} page(s) via MRC fallback (ocrmypdf --optimize 3: ` +
-        `JBIG2 text mask + pngquant color${cfg.grayscale ? ", grayscale" : ""}` +
-        `${cfg.mrcBgDownsample > 1 ? `, bg downsample ${cfg.mrcBgDownsample}` : ""})...`);
+      log(`Assembling ${sorted.length} page(s) via MRC fallback (full-res OCR, then ` +
+        `${(300 / (cfg.mrcBgDownsample >= 1 ? cfg.mrcBgDownsample : 1)).toFixed(0)}-dpi image downsample` +
+        `${cfg.grayscale ? ", grayscale" : ""})...`);
       buildMrcFallbackPdf(sorted, cfg.staging, outPath);
     } else {
       log(`Assembling ${sorted.length} page(s) via MRC (recode_pdf: JBIG2 mask + JP2 bg, ` +
@@ -982,10 +1044,10 @@ async function finishBatch(pages, { interactive = true, presetName = null } = {}
         if (!(e instanceof ExitError)) throw e;
         // Auto-fallback: recode_pdf failed or produced no text layer. Clean any
         // partial output and rebuild with the guaranteed-searchable fallback.
-        warn(`recode_pdf MRC failed (${e.message}). Falling back to the ocrmypdf ` +
-          "--optimize 3 MRC path (still searchable).");
+        warn(`recode_pdf MRC failed (${e.message}). Falling back to the full-res-OCR ` +
+          "+ Ghostscript downsample MRC path (still searchable).");
         try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }
-        log(`Reassembling ${sorted.length} page(s) via MRC fallback (ocrmypdf --optimize 3)...`);
+        log(`Reassembling ${sorted.length} page(s) via MRC fallback (full-res OCR + image downsample)...`);
         buildMrcFallbackPdf(sorted, cfg.staging, outPath);
       }
     }
@@ -1471,10 +1533,15 @@ async function selfTest() {
   if (!madeImgs) { assert(false, "generate test JPEGs (need magick or sips)"); }
   state.stagedPages = [p1, p2, p3];
   let posOut = null;
+  // This phase smoke-tests the standard (non-MRC) assembly path; the default MRC
+  // pipeline is exercised end-to-end by the [MRC]/[MRC-FB] phases below.
+  const savedMrcP1 = cfg.mrc;
+  cfg.mrc = false;
   try {
     const res = await finishBatch([p1, p2, p3], { interactive: false, presetName: "selftest-doc" });
     posOut = res.outPath;
   } catch (e) { assert(false, `positive finishBatch threw: ${e.message}`); }
+  cfg.mrc = savedMrcP1;
   if (posOut && fs.existsSync(posOut)) {
     assert(pdfPageCount(posOut) === 3, "page count == 3 (pdfinfo)");
     if (haveMagick) {
@@ -1542,10 +1609,13 @@ async function selfTest() {
     run("qpdf", [posOut, "--pages", ".", "2", "--", pdfB]);
     if (fs.existsSync(pdfA) && fs.existsSync(pdfB)) {
       state.stagedPages = [pdfA, pdfB];
+      const savedMrcP4 = cfg.mrc;
+      cfg.mrc = false; // this phase exercises the standard (non-MRC) PDF-input path
       try {
         const res = await finishBatch([pdfA, pdfB], { interactive: false, presetName: "selftest-pdfin" });
         assert(res.outPath && pdfPageCount(res.outPath) === 2, "PDF-input batch -> 2-page searchable PDF");
       } catch (e) { assert(false, `PDF-input finishBatch threw: ${e.message}`); }
+      cfg.mrc = savedMrcP4;
     } else {
       assert(false, "could not synthesize single-page PDFs for PDF-input test");
     }
@@ -1583,8 +1653,8 @@ async function selfTest() {
     if (!built) {
       assert(false, "generate realistic PDF-format pages (magick/img2pdf)");
     } else {
-      const savedQ = cfg.quality, savedFull = cfg.fullQuality;
-      cfg.quality = 85; cfg.fullQuality = false;
+      const savedQ = cfg.quality, savedFull = cfg.fullQuality, savedMrcP5 = cfg.mrc;
+      cfg.quality = 85; cfg.fullQuality = false; cfg.mrc = false; // non-MRC quality lever
       state.stagedPages = rp.slice();
       let q85Out = null, q85Sizes = [];
       try {
@@ -1592,7 +1662,7 @@ async function selfTest() {
         q85Out = res.outPath;
         if (q85Out) q85Sizes = pdfImageSizesKB(q85Out);
       } catch (e) { assert(false, `realistic PDF q85 finishBatch threw: ${e.message}`); }
-      cfg.quality = savedQ; cfg.fullQuality = savedFull;
+      cfg.quality = savedQ; cfg.fullQuality = savedFull; cfg.mrc = savedMrcP5;
 
       if (q85Out && q85Sizes.length === 3) {
         const maxKB = Math.max(...q85Sizes);
@@ -1636,8 +1706,8 @@ async function selfTest() {
     if (!built) {
       assert(false, "generate realistic PDF-format pages for full-quality test");
     } else {
-      const savedQ = cfg.quality, savedFull = cfg.fullQuality;
-      cfg.fullQuality = true;
+      const savedQ = cfg.quality, savedFull = cfg.fullQuality, savedMrcP6 = cfg.mrc;
+      cfg.fullQuality = true; cfg.mrc = false; // non-MRC full-quality lever
       state.stagedPages = fp.slice();
       let fqOut = null, fqSizes = [];
       try {
@@ -1645,7 +1715,7 @@ async function selfTest() {
         fqOut = res.outPath;
         if (fqOut) fqSizes = pdfImageSizesKB(fqOut);
       } catch (e) { assert(false, `realistic PDF full-quality finishBatch threw: ${e.message}`); }
-      cfg.quality = savedQ; cfg.fullQuality = savedFull;
+      cfg.quality = savedQ; cfg.fullQuality = savedFull; cfg.mrc = savedMrcP6;
 
       if (fqOut && fqSizes.length === 3) {
         const minKB = Math.min(...fqSizes);
@@ -1672,7 +1742,8 @@ async function selfTest() {
     // Regenerate pages (phase 1 may have consumed/cleaned); ensure present.
     makeTestJpeg(p1, "Alpha"); makeTestJpeg(p2, "Bravo"); makeTestJpeg(p3, "Charlie");
 
-    const savedQ = cfg.quality, savedFull = cfg.fullQuality;
+    const savedQ = cfg.quality, savedFull = cfg.fullQuality, savedMrcP7 = cfg.mrc;
+    cfg.mrc = false; // this phase exercises the non-MRC quality lever
 
     cfg.fullQuality = true; cfg.quality = 85;
     try {
@@ -1694,7 +1765,7 @@ async function selfTest() {
       sizeQ80 = r.outPath ? fs.statSync(r.outPath).size : -1;
     } catch (e) { log(`  (q80 assemble note: ${e.message})`); }
 
-    cfg.quality = savedQ; cfg.fullQuality = savedFull;
+    cfg.quality = savedQ; cfg.fullQuality = savedFull; cfg.mrc = savedMrcP7;
 
     if (haveMagick && sizeFull > 0 && sizeQ80 > 0) {
       // Assert the lever works directionally: q80 < q85 default < full-quality.
@@ -1781,8 +1852,8 @@ async function selfTest() {
     }
   }
 
-  // --- [MRC-FB] MRC FALLBACK smoke (FEAT-003): the ocrmypdf --optimize 3 path
-  // needs NO recode_pdf, so this phase ALWAYS runs on the user's machine (never
+  // --- [MRC-FB] MRC FALLBACK smoke (FEAT-003/004): the full-res-OCR + Ghostscript
+  // downsample path needs NO recode_pdf, so this phase ALWAYS runs (never
   // SKIP for a tool reason). Exercise buildMrcFallbackPdf on 2-3 synthetic
   // makeRealPageJpeg() pages via the REAL finishBatch (--mrc-fallback forced)
   // and assert: output exists, page count correct, pdftotext status 0
@@ -1792,7 +1863,7 @@ async function selfTest() {
   // img2pdf to build the full-quality baseline; those are already required by
   // preflight for assembly, so this is not a tool-gated SKIP of the fallback.
   log("");
-  log("[MRC-FB] MRC fallback smoke (ocrmypdf --optimize 3; ALWAYS runs, no recode_pdf)");
+  log("[MRC-FB] MRC fallback smoke (full-res OCR + gs downsample; ALWAYS runs, no recode_pdf)");
   if (!haveMagick || !have("img2pdf")) {
     // Cannot synthesize representative pages / build the baseline without these;
     // the fallback itself still works, but the SMOKE needs them to compare.
