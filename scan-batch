@@ -300,6 +300,13 @@ function parseFloatStrict(v, flag) {
 function parseArgs(argv) {
   const args = argv.slice();
   let positionalOut = "";
+  // Track whether the user EXPLICITLY asked for these two mutually exclusive
+  // intents, independent of the derived cfg state (cfg.mrc defaults true and is
+  // cleared by --full-quality/--no-mrc/--quality, so the final cfg flags alone
+  // cannot tell "both were passed" apart from "last one won"). We reject only
+  // when BOTH were explicitly requested, in either order.
+  let sawExplicitMrc = false;
+  let sawFullQuality = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     switch (a) {
@@ -322,7 +329,7 @@ function parseArgs(argv) {
       }
       case "--full-quality":
         // Raw full-resolution page: the non-MRC path. Opt out of default MRC.
-        cfg.fullQuality = true; cfg.mrc = false; break;
+        cfg.fullQuality = true; cfg.mrc = false; sawFullQuality = true; break;
       case "--no-mrc":
         // Explicit opt-out: use the full-resolution q70 (non-MRC) path.
         cfg.mrc = false; cfg.mrcFallback = false; break;
@@ -348,7 +355,7 @@ function parseArgs(argv) {
       case "--keep-staging":
         cfg.keepStaging = true; break;
       case "--mrc":
-        cfg.mrc = true; break;
+        cfg.mrc = true; sawExplicitMrc = true; break;
       case "--mrc-bg-downsample": {
         const n = parseFloatStrict(wantValue(args, i, a), a); i++;
         if (n < 1) throw new ExitError(1, "--mrc-bg-downsample must be >= 1");
@@ -357,7 +364,9 @@ function parseArgs(argv) {
       case "--mrc-fallback":
         // Forcing the fallback implies the MRC pipeline (so --mrc is optional
         // alongside it) and produces a smaller, searchable PDF without recode_pdf.
-        cfg.mrc = true; cfg.mrcFallback = true; break;
+        // It is an explicit request for MRC, so it conflicts with --full-quality
+        // just like --mrc does.
+        cfg.mrc = true; cfg.mrcFallback = true; sawExplicitMrc = true; break;
       case "--version":
         log(versionString()); throw new ExitError(0);
       case "--self-test":
@@ -382,8 +391,11 @@ function parseArgs(argv) {
 
   // --mrc and --full-quality are contradictory: MRC deliberately recompresses
   // the background (lossy, downsampled) to shrink the file, which is the exact
-  // opposite of --full-quality's "preserve the raw scanner JPEG" promise.
-  if (cfg.mrc && cfg.fullQuality) {
+  // opposite of --full-quality's "preserve the raw scanner JPEG" promise. Reject
+  // only when BOTH were requested EXPLICITLY, in either order — do NOT key off
+  // the derived cfg flags: cfg.mrc defaults true, so `--full-quality` alone (a
+  // clean opt-out) must still work, and a bare run (default MRC) must still run.
+  if (sawExplicitMrc && sawFullQuality) {
     throw new ExitError(1, "--mrc and --full-quality are contradictory (MRC recompresses to shrink; " +
       "full-quality preserves the raw JPEG). Pick one.");
   }
